@@ -1,0 +1,46 @@
+#pragma once
+
+// ─── WiFi ───────────────────────────────────────────────────────────
+// Your local WiFi network credentials.
+#define WIFI_SSID       "your-wifi-ssid"
+#define WIFI_PASS       "your-wifi-password"
+
+// ─── ErinOS Server ──────────────────────────────────────────────────
+// Hostname or IP of your ErinOS appliance.
+// User ID: your PIN or Telegram ID (used for X-User-ID header).
+#define ERINOS_HOST     "erinos.local"
+#define ERINOS_PORT     4567
+#define ERINOS_USER_ID  "1234"
+
+// ─── Audio ──────────────────────────────────────────────────────────
+// Do not change unless you know what you're doing.
+#define SAMPLE_RATE     16000
+#define SAMPLE_BITS     16
+#define CHANNELS        1
+#define RECORD_SECONDS  10      // Max recording duration per press
+
+// ─── Hardware (Waveshare ESP32-S3-AUDIO-Board) ─────────────────────
+// Pin assignments match the board's schematic. No need to change.
+
+// I2C
+#define I2C_SDA_PIN     11
+#define I2C_SCL_PIN     10
+#define I2C_FREQ_HZ     100000
+
+// I2S
+#define I2S_MCLK_PIN    12
+#define I2S_SCLK_PIN    13
+#define I2S_LRCK_PIN    14
+#define I2S_DOUT_PIN    16      // Speaker (ES8311)
+#define I2S_DIN_PIN     15      // Mic (ES7210)
+
+// I2C addresses
+#define ES8311_ADDR     0x18
+#define ES7210_ADDR     0x40
+
+// LEDs (WS2812 ring)
+#define LED_PIN         38
+#define LED_COUNT       7
+
+// Button (BOOT = push-to-talk)
+#define BUTTON_PIN      0

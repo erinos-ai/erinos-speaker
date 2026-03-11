@@ -1,0 +1,2 @@
+source /Users/filippo/code/erinos/speaker/build/gdbinit/symbols
+source /Users/filippo/code/erinos/speaker/build/gdbinit/connect
