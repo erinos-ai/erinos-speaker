@@ -112,7 +112,7 @@ esp_err_t voice_request(const int16_t *audio, size_t audio_samples,
     };
 
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%d/api/voice", ERINOS_HOST, ERINOS_PORT);
+    snprintf(url, sizeof(url), "http://%s:%d/api/chat", ERINOS_HOST, ERINOS_PORT);
 
     char content_type[64];
     snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
