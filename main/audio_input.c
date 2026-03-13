@@ -1,64 +1,25 @@
 #include "audio_input.h"
 #include "config.h"
 
-#include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#include "es7210_adc.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include <stdlib.h>
 
 static const char *TAG = "audio_in";
 static i2s_chan_handle_t rx_chan = NULL;
 
-// ─── ES7210 register setup (minimal for 16kHz mono capture) ────────
+// I2C bus shared with ES8311 (audio_output.c)
 i2c_master_bus_handle_t i2c_bus = NULL;
-static i2c_master_dev_handle_t es7210_dev = NULL;
 
-static esp_err_t es7210_write_reg(uint8_t reg, uint8_t val)
+esp_err_t audio_input_init(i2s_chan_handle_t shared_rx_chan)
 {
-    uint8_t buf[2] = {reg, val};
-    return i2c_master_transmit(es7210_dev, buf, 2, 100);
-}
+    rx_chan = shared_rx_chan;
 
-static esp_err_t es7210_init(void)
-{
-    // Reset
-    es7210_write_reg(0x00, 0xFF);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    es7210_write_reg(0x00, 0x41);
-
-    // Clock: MCLK from I2S master
-    es7210_write_reg(0x01, 0x20);  // CLK ON
-    es7210_write_reg(0x02, 0xC1);  // MCLK -> internal
-    es7210_write_reg(0x03, 0x04);  // MCLK/LRCK ratio for 16kHz
-    es7210_write_reg(0x04, 0x01);  // MCLK pre-div
-    es7210_write_reg(0x05, 0x00);  // ADC OSR
-
-    // I2S format: 16-bit, standard
-    es7210_write_reg(0x11, 0x60);  // SDP format
-    es7210_write_reg(0x06, 0x00);  // TDM off
-
-    // ADC enable: channel 1 only (mono)
-    es7210_write_reg(0x07, 0x20);  // Power up ADC1
-    es7210_write_reg(0x08, 0x10);  // Power management
-
-    // Analog: MIC1 PGA gain
-    es7210_write_reg(0x43, 0x1E);  // +30dB gain
-    es7210_write_reg(0x44, 0x1E);
-    es7210_write_reg(0x45, 0x00);
-    es7210_write_reg(0x46, 0x00);
-
-    // Power up analog
-    es7210_write_reg(0x40, 0x42);
-    es7210_write_reg(0x41, 0x70);
-    es7210_write_reg(0x42, 0x00);
-
-    ESP_LOGI(TAG, "ES7210 initialized");
-    return ESP_OK;
-}
-
-esp_err_t audio_input_init(void)
-{
     // I2C bus (shared with ES8311 — init once)
     if (i2c_bus == NULL) {
         i2c_master_bus_config_t bus_cfg = {
@@ -72,57 +33,85 @@ esp_err_t audio_input_init(void)
         ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
     }
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = ES7210_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
+    // Use esp_codec_dev to properly initialize ES7210 registers.
+    // We only use it for init — recording uses direct I2S reads
+    // to avoid conflicts with the output codec dev on the same I2S bus.
+    audio_codec_i2c_cfg_t i2c_cfg = {
+        .port = 0,
+        .addr = ES7210_CODEC_DEFAULT_ADDR,
+        .bus_handle = i2c_bus,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_cfg, &es7210_dev));
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
 
-    es7210_init();
-
-    // I2S RX channel (microphone)
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_MCLK_PIN,
-            .bclk = I2S_SCLK_PIN,
-            .ws = I2S_LRCK_PIN,
-            .dout = I2S_GPIO_UNUSED,
-            .din = I2S_DIN_PIN,
-            .invert_flags = { false, false, false },
-        },
+    es7210_codec_cfg_t es7210_cfg = {
+        .ctrl_if = ctrl_if,
+        .master_mode = false,
+        .mic_selected = ES7210_SEL_MIC1,
+        .mclk_src = ES7210_MCLK_FROM_PAD,
     };
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+    const audio_codec_if_t *codec_if = es7210_codec_new(&es7210_cfg);
+    if (!codec_if) {
+        ESP_LOGE(TAG, "Failed to create ES7210 codec");
+        return ESP_FAIL;
+    }
 
-    ESP_LOGI(TAG, "Audio input ready (16kHz 16-bit mono)");
+    // Open codec to configure registers, then leave it — we read I2S directly
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = SAMPLE_RATE,
+        .channel = 2,
+        .bits_per_sample = 16,
+    };
+    int ret = codec_if->open(codec_if, &fs, sizeof(fs));
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Failed to open ES7210: %d", ret);
+        return ESP_FAIL;
+    }
+    // Set mic gain
+    codec_if->set_mic_gain(codec_if, 30.0);
+
+    ESP_LOGI(TAG, "Audio input ready (16kHz 16-bit via es7210 driver)");
     return ESP_OK;
 }
 
 size_t audio_input_record(int16_t *buffer, size_t max_samples)
 {
-    size_t total = 0;
+    // ES7210 outputs stereo I2S (mic1=L, mic2=R).
+    // Read stereo frames via direct I2S, extract left channel.
+    #define STEREO_CHANNELS 2
+    static int16_t stereo_buf[256 * STEREO_CHANNELS];
+    size_t mono_samples = 0;
     size_t bytes_read;
-    size_t max_bytes = max_samples * sizeof(int16_t);
+    size_t min_samples = SAMPLE_RATE / 4;  // 250ms minimum
 
-    while (total < max_bytes) {
-        size_t chunk = 1024;
-        if (total + chunk > max_bytes) chunk = max_bytes - total;
+    // Debug: track energy per channel
+    int64_t ch_energy[STEREO_CHANNELS] = {0};
 
-        esp_err_t ret = i2s_channel_read(rx_chan, (uint8_t *)buffer + total, chunk, &bytes_read, pdMS_TO_TICKS(100));
-        if (ret != ESP_OK || bytes_read == 0) break;
-        total += bytes_read;
+    while (mono_samples < max_samples) {
+        size_t frames_to_read = 256;
+        if (mono_samples + frames_to_read > max_samples)
+            frames_to_read = max_samples - mono_samples;
 
-        // Check if button released (stop recording)
-        if (gpio_get_level(BUTTON_PIN) == 1) break;
+        size_t read_bytes = frames_to_read * STEREO_CHANNELS * sizeof(int16_t);
+        esp_err_t ret = i2s_channel_read(rx_chan, stereo_buf, read_bytes, &bytes_read, pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK || bytes_read == 0) {
+            ESP_LOGW(TAG, "I2S read stopped: ret=%d bytes_read=%zu", ret, bytes_read);
+            break;
+        }
+
+        size_t frames_read = bytes_read / (STEREO_CHANNELS * sizeof(int16_t));
+        for (size_t i = 0; i < frames_read; i++) {
+            buffer[mono_samples + i] = stereo_buf[i * STEREO_CHANNELS];  // left channel
+            for (int c = 0; c < STEREO_CHANNELS; c++) {
+                int16_t v = stereo_buf[i * STEREO_CHANNELS + c];
+                ch_energy[c] += (int64_t)v * v;
+            }
+        }
+        mono_samples += frames_read;
+
+        if (mono_samples >= min_samples && gpio_get_level(BUTTON_PIN) == 1) break;
     }
 
-    ESP_LOGI(TAG, "Recorded %zu samples (%.1fs)", total / 2, (float)(total / 2) / SAMPLE_RATE);
-    return total / sizeof(int16_t);
+    ESP_LOGI(TAG, "Recorded %zu samples (%.1fs)", mono_samples, (float)mono_samples / SAMPLE_RATE);
+    ESP_LOGI(TAG, "Channel energy: L=%lld R=%lld", ch_energy[0], ch_energy[1]);
+    return mono_samples;
 }
